@@ -1,0 +1,347 @@
+// Event Booking and QR Ticketing Platform
+// Database design aligned with Plan.md.
+// IDs use BIGINT to align with Laravel's default $table->id().
+// Money uses one platform-configured currency; this schema does not implement
+// multiple currencies, FX conversion, refunds, or production payments.
+
+// -----------------------------------------------------------------------------
+// Enums
+// -----------------------------------------------------------------------------
+
+Enum account_status {
+  active
+  suspended
+}
+
+Enum event_status {
+  draft
+  published
+  unpublished
+  rejected
+  suspended
+}
+
+Enum order_status {
+  pending
+  paid
+  failed
+  expired
+}
+
+Enum payment_status {
+  pending
+  succeeded
+  failed
+  expired
+}
+
+Enum payment_environment {
+  test
+}
+
+Enum ticket_status {
+  valid
+  used
+  cancelled
+}
+
+Enum scan_outcome {
+  valid
+  invalid
+  used
+}
+
+// -----------------------------------------------------------------------------
+// Identity, roles, and permissions
+// -----------------------------------------------------------------------------
+
+Table users {
+  id "bigint unsigned" [pk, increment]
+  name varchar(255) [not null]
+  email varchar(255) [not null, unique]
+  password varchar(255) [not null, note: 'Store only a one-way password hash; never a plaintext password.']
+  status account_status [not null, default: 'active']
+  email_verified_at datetime [null]
+  created_at datetime [not null]
+  updated_at datetime [not null]
+
+  indexes {
+    status
+  }
+}
+
+Table roles {
+  id "bigint unsigned" [pk, increment]
+  name varchar(255) [not null]
+  guard_name varchar(255) [not null, note: 'Must match the Laravel authentication guard configured for these roles and permissions.']
+  created_at datetime [null]
+  updated_at datetime [null]
+
+  indexes {
+    (name, guard_name) [unique]
+  }
+}
+
+Table permissions {
+  id "bigint unsigned" [pk, increment]
+  name varchar(255) [not null]
+  guard_name varchar(255) [not null, note: 'Must match the Laravel authentication guard configured for these roles and permissions.']
+  created_at datetime [null]
+  updated_at datetime [null]
+
+  indexes {
+    (name, guard_name) [unique]
+  }
+}
+
+// Spatie/laravel-permission polymorphic user-to-role pivot.
+Table model_has_roles {
+  role_id "bigint unsigned" [not null, ref: > roles.id]
+  model_type varchar(255) [not null, note: 'Polymorphic model type, normally the User Eloquent model.']
+  model_id "bigint unsigned" [not null, note: 'ID of the user (or another permission-enabled model).']
+
+  indexes {
+    (role_id, model_id, model_type) [pk]
+    (model_id, model_type)
+  }
+}
+
+// Spatie/laravel-permission polymorphic user-to-permission pivot.
+Table model_has_permissions {
+  permission_id "bigint unsigned" [not null, ref: > permissions.id]
+  model_type varchar(255) [not null, note: 'Polymorphic model type, normally the User Eloquent model.']
+  model_id "bigint unsigned" [not null, note: 'ID of the user (or another permission-enabled model).']
+
+  indexes {
+    (permission_id, model_id, model_type) [pk]
+    (model_id, model_type)
+  }
+}
+
+// Spatie/laravel-permission role-to-permission pivot.
+Table role_has_permissions {
+  permission_id "bigint unsigned" [not null, ref: > permissions.id]
+  role_id "bigint unsigned" [not null, ref: > roles.id]
+
+  indexes {
+    (permission_id, role_id) [pk]
+    (role_id)
+  }
+}
+
+// -----------------------------------------------------------------------------
+// Events and ticket types
+// -----------------------------------------------------------------------------
+
+Table events {
+  id "bigint unsigned" [pk, increment]
+  organizer_user_id "bigint unsigned" [not null, ref: > users.id]
+  title varchar(255) [not null]
+  description text [null]
+  starts_at datetime [not null]
+  ends_at datetime [null]
+  venue varchar(255) [not null]
+  image_path varchar(2048) [not null, note: 'Storage path or object key for the uploaded event image, not the image binary.']
+  status event_status [not null, default: 'draft']
+  published_at datetime [null]
+  created_at datetime [not null]
+  updated_at datetime [not null]
+
+  checks {
+    `ends_at IS NULL OR ends_at >= starts_at` [name: 'chk_events_dates']
+  }
+
+  indexes {
+    (organizer_user_id, status)
+    (status, starts_at)
+    starts_at
+  }
+}
+
+Table ticket_types {
+  id "bigint unsigned" [pk, increment]
+  event_id "bigint unsigned" [not null, ref: > events.id]
+  name varchar(150) [not null]
+  description text [null]
+  price decimal(12,2) [not null, note: 'Price in the single platform-configured currency.']
+  total_quantity "int unsigned" [not null, note: 'Total sellable inventory. Remaining stock is derived from paid tickets and unexpired pending order reservations.']
+  sales_starts_at datetime [null]
+  sales_ends_at datetime [null]
+  is_active boolean [not null, default: true]
+  created_at datetime [not null]
+  updated_at datetime [not null]
+
+  checks {
+    `price >= 0` [name: 'chk_ticket_types_price_nonnegative']
+    `total_quantity >= 0` [name: 'chk_ticket_types_quantity_nonnegative']
+    `sales_ends_at IS NULL OR sales_starts_at IS NULL OR sales_ends_at > sales_starts_at` [name: 'chk_ticket_types_sales_window']
+  }
+
+  indexes {
+    (event_id, is_active)
+    (event_id, name) [unique]
+    (sales_starts_at, sales_ends_at)
+  }
+}
+
+// -----------------------------------------------------------------------------
+// Orders and order line items
+// -----------------------------------------------------------------------------
+
+Table orders {
+  id "bigint unsigned" [pk, increment]
+  attendee_user_id "bigint unsigned" [not null, ref: > users.id]
+  order_number varchar(40) [not null, unique]
+  status order_status [not null, default: 'pending']
+  total_amount decimal(12,2) [not null, note: 'Server-calculated order total using unit-price snapshots; no tax, discount, or fee engine is included.']
+  reservation_expires_at datetime [null, note: 'While status is pending, this is the inventory hold expiry. Expired holds no longer count against availability.']
+  idempotency_key varchar(100) [null, note: 'Client-supplied retry key; unique per attendee when present.']
+  paid_at datetime [null]
+  created_at datetime [not null]
+  updated_at datetime [not null]
+
+  checks {
+    `total_amount >= 0` [name: 'chk_orders_total_nonnegative']
+  }
+
+  indexes {
+    (attendee_user_id, status, created_at)
+    (status, reservation_expires_at)
+    (attendee_user_id, idempotency_key) [unique]
+  }
+}
+
+Table order_items {
+  id "bigint unsigned" [pk, increment]
+  order_id "bigint unsigned" [not null, ref: > orders.id]
+  ticket_type_id "bigint unsigned" [not null, ref: > ticket_types.id]
+  quantity "int unsigned" [not null, note: 'Number of tickets requested for this ticket type; must be a positive integer.']
+  unit_price decimal(12,2) [not null, note: 'Price snapshot taken when the order is created; do not recalculate from the current ticket type price.']
+  line_total decimal(12,2) [not null, note: 'Server-calculated unit_price multiplied by quantity.']
+
+  checks {
+    `quantity > 0` [name: 'chk_order_items_quantity_positive']
+    `unit_price >= 0 AND line_total >= 0` [name: 'chk_order_items_amounts_nonnegative']
+  }
+
+  indexes {
+    (order_id, ticket_type_id) [unique]
+    (ticket_type_id, order_id)
+  }
+}
+
+// -----------------------------------------------------------------------------
+// Issued tickets and QR redemption
+// -----------------------------------------------------------------------------
+
+Table tickets {
+  id "bigint unsigned" [pk, increment]
+  order_id "bigint unsigned" [not null, ref: > orders.id]
+  order_item_id "bigint unsigned" [not null, ref: > order_items.id]
+  ticket_type_id "bigint unsigned" [not null, ref: > ticket_types.id]
+  attendee_user_id "bigint unsigned" [not null, ref: > users.id]
+  ticket_number varchar(40) [not null, unique]
+  qr_token_hash char(64) [not null, unique, note: 'SHA-256 hash of a high-entropy opaque QR token. Store the hash only; never persist the raw QR token.']
+  status ticket_status [not null, default: 'valid', note: 'Valid means paid and not yet redeemed; only paid orders may receive issued tickets.']
+  issued_at datetime [not null]
+  redeemed_at datetime [null]
+  redeemed_by_user_id "bigint unsigned" [null, ref: > users.id, note: 'Gate staff user who completed the first successful redemption.']
+  cancelled_at datetime [null]
+  created_at datetime [not null]
+  updated_at datetime [not null]
+
+  indexes {
+    (attendee_user_id, status)
+    (ticket_type_id, status)
+    (order_id)
+    (order_item_id)
+    (redeemed_by_user_id, redeemed_at)
+  }
+}
+
+// Gate staff assignments are event-scoped. A user must be assigned to an event
+// (or have the separate platform-wide permission) before scanning its tickets.
+Table event_gate_staff {
+  id "bigint unsigned" [pk, increment]
+  event_id "bigint unsigned" [not null, ref: > events.id]
+  user_id "bigint unsigned" [not null, ref: > users.id]
+  assigned_by_user_id "bigint unsigned" [null, ref: > users.id]
+  created_at datetime [not null]
+
+  indexes {
+    (event_id, user_id) [unique]
+    (user_id, event_id)
+  }
+}
+
+// Includes valid, invalid, and already-used scan attempts. ticket_id is null
+// when the submitted token does not match a known ticket.
+Table ticket_scan_logs {
+  id "bigint unsigned" [pk, increment]
+  event_id "bigint unsigned" [not null, ref: > events.id]
+  ticket_id "bigint unsigned" [null, ref: > tickets.id]
+  gate_staff_user_id "bigint unsigned" [not null, ref: > users.id]
+  outcome scan_outcome [not null]
+  failure_reason varchar(100) [null]
+  scanned_at datetime [not null, note: 'Timestamp of the scan attempt; valid means this scan successfully changed the ticket from valid to used.']
+
+  indexes {
+    (event_id, scanned_at)
+    (gate_staff_user_id, scanned_at)
+    (ticket_id, scanned_at)
+    (outcome, scanned_at)
+  }
+}
+
+// -----------------------------------------------------------------------------
+// Payment attempts
+// -----------------------------------------------------------------------------
+
+Table payments {
+  id "bigint unsigned" [pk, increment]
+  order_id "bigint unsigned" [not null, ref: > orders.id]
+  gateway varchar(100) [not null, note: 'Configured payment provider name; the application supports one provider for this project.']
+  environment payment_environment [not null, default: 'test']
+  gateway_payment_id varchar(255) [null, note: 'Payment/transaction identifier returned by the gateway.']
+  gateway_event_id varchar(255) [null, note: 'Webhook event identifier used to make callback processing idempotent.']
+  status payment_status [not null, default: 'pending']
+  amount decimal(12,2) [not null]
+  currency char(3) [not null, note: 'Single configured platform currency code; no per-order currency selection or conversion.']
+  idempotency_key varchar(100) [null]
+  failure_code varchar(100) [null]
+  failure_message varchar(500) [null, note: 'Sanitized provider failure message; must not contain card data, credentials, or secrets.']
+  paid_at datetime [null]
+  created_at datetime [not null]
+  updated_at datetime [not null]
+
+  checks {
+    `amount >= 0` [name: 'chk_payments_amount_nonnegative']
+  }
+
+  indexes {
+    (order_id, status)
+    (gateway, gateway_payment_id) [unique]
+    (gateway, gateway_event_id) [unique]
+    (order_id, idempotency_key) [unique]
+  }
+}
+
+// -----------------------------------------------------------------------------
+// Administrative audit trail
+// -----------------------------------------------------------------------------
+
+Table audit_logs {
+  id "bigint unsigned" [pk, increment]
+  actor_user_id "bigint unsigned" [null, ref: > users.id, note: 'Null for system-generated activity.']
+  action varchar(150) [not null]
+  subject_type varchar(255) [null, note: 'Polymorphic model class for the affected record.']
+  subject_id "bigint unsigned" [null, note: 'ID of the affected record; polymorphic and therefore has no direct foreign key.']
+  metadata json [null, note: 'Sanitized audit metadata only; never store passwords, tokens, QR secrets, card data, or provider secrets.']
+  created_at datetime [not null]
+
+  indexes {
+    (actor_user_id, created_at)
+    (subject_type, subject_id, created_at)
+    (action, created_at)
+  }
+}
